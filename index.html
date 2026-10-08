@@ -44,6 +44,7 @@ input{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);bac
 
 <section class="card">
   <h2>Chia sẻ vị trí cho người thân</h2>
+  <p class="note" style="margin:0 0 12px">Trang tự gửi vị trí liên tục ngay khi mở, không cần bấm gì thêm. Hãy giữ app BLE Link mở, màn hình sáng và cắm sạc nếu đi lâu.</p>
   <label for="fbUrl">Địa chỉ Firebase Realtime Database</label>
   <input id="fbUrl" autocomplete="off" autocapitalize="off">
   <button id="btnShare">Bắt đầu chia sẻ vị trí</button>
@@ -64,9 +65,11 @@ input{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);bac
 <script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-database-compat.js"></script>
 <script>
 const DEFAULT_URL = "https://smart-cane-12a77-default-rtdb.asia-southeast1.firebasedatabase.app";
-const SVC = 0xFFE0, CHR = 0xFFE1, PUSH_MS = 15000, COOLDOWN_MS = 10000;
+const SVC = 0xFFE0, CHR = 0xFFE1, COOLDOWN_MS = 10000;
+const MIN_GAP_MS = 3000, HEARTBEAT_MS = 10000, HIST_MIN_M = 8;
 const $ = id => document.getElementById(id);
 let dev = null, db = null, watchId = null, timer = null, wake = null, gps = null, bleOn = false, rx = "";
+let lastPush = 0, lastHist = null, wakeLogged = false;
 const lastAlert = {};
 
 function store(k, v) {
@@ -107,12 +110,25 @@ function ensureDb() {
   return true;
 }
 
+function dist(a, b) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 function pushCurrent() {
   if (!db || !gps) return;
+  const now = Date.now();
+  lastPush = now;
   db.ref("smartcane/current")
-    .set({ lat: gps.lat, lng: gps.lng, acc: gps.acc, ble: bleOn, updatedAt: Date.now() })
-    .then(() => note("Đã gửi vị trí lúc " + new Date().toLocaleTimeString("vi-VN")))
+    .set({ lat: gps.lat, lng: gps.lng, acc: gps.acc, ble: bleOn, updatedAt: now })
+    .then(() => note("Đang chia sẻ liên tục. Lần gửi gần nhất lúc " + new Date().toLocaleTimeString("vi-VN")))
     .catch(e => note("Lỗi Firebase: " + e.message));
+  if (!lastHist || dist(lastHist, gps) >= HIST_MIN_M) {
+    lastHist = { lat: gps.lat, lng: gps.lng };
+    db.ref("smartcane/history").push({ lat: gps.lat, lng: gps.lng, t: now });
+  }
 }
 
 function sendAlert(type) {
@@ -129,26 +145,38 @@ function sendAlert(type) {
 
 async function keepAwake() {
   try {
-    if ("wakeLock" in navigator) { wake = await navigator.wakeLock.request("screen"); addLog("Đang giữ màn hình sáng."); return; }
+    if ("wakeLock" in navigator) {
+      wake = await navigator.wakeLock.request("screen");
+      if (!wakeLogged) { addLog("Đang giữ màn hình sáng."); wakeLogged = true; }
+      return;
+    }
   } catch (e) {}
-  addLog("Không giữ được màn hình sáng. Hãy đặt Tự động khóa = Không bao giờ trong Cài đặt iPhone.");
+  if (!wakeLogged) {
+    addLog("Chưa giữ được màn hình sáng. Hãy đặt Tự động khóa = Không bao giờ trong Cài đặt iPhone.");
+    wakeLogged = true;
+  }
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && sharing()) keepAwake();
+  if (document.visibilityState === "visible" && sharing()) { startWatch(); keepAwake(); }
 });
+document.addEventListener("pointerdown", () => { if (sharing() && !wake) keepAwake(); });
 
+function startWatch() {
+  if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+  watchId = navigator.geolocation.watchPosition(p => {
+    gps = { lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy) };
+    $("gpsOut").textContent = "Vị trí: " + gps.lat.toFixed(6) + ", " + gps.lng.toFixed(6) + " (sai số khoảng " + gps.acc + " m)";
+    if (Date.now() - lastPush >= MIN_GAP_MS) pushCurrent();
+  }, e => { $("gpsOut").textContent = "Lỗi lấy vị trí: " + e.message; },
+  { enableHighAccuracy: true, maximumAge: 2000, timeout: 20000 });
+}
 function startShare() {
   if (!ensureDb()) return;
   if (!navigator.geolocation) { $("gpsOut").textContent = "Thiết bị không hỗ trợ định vị."; return; }
-  watchId = navigator.geolocation.watchPosition(p => {
-    const first = !gps;
-    gps = { lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy) };
-    $("gpsOut").textContent = "Vị trí: " + gps.lat.toFixed(6) + ", " + gps.lng.toFixed(6) + " (sai số khoảng " + gps.acc + " m)";
-    if (first) pushCurrent();
-  }, e => { $("gpsOut").textContent = "Lỗi lấy vị trí: " + e.message; },
-  { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
-  timer = setInterval(pushCurrent, PUSH_MS);
+  startWatch();
+  timer = setInterval(() => { if (Date.now() - lastPush >= HEARTBEAT_MS) pushCurrent(); }, 2000);
   keepAwake();
+  store("autoShare", "1");
   $("btnShare").textContent = "Dừng chia sẻ vị trí";
   $("btnShare").className = "alt";
 }
@@ -156,10 +184,13 @@ function stopShare() {
   navigator.geolocation.clearWatch(watchId);
   watchId = null; clearInterval(timer);
   if (wake) { wake.release(); wake = null; }
+  store("autoShare", "0");
   $("btnShare").textContent = "Bắt đầu chia sẻ vị trí";
   $("btnShare").className = "";
+  note("Đã dừng chia sẻ.");
 }
 $("btnShare").onclick = () => (sharing() ? stopShare() : startShare());
+if (store("autoShare") !== "0") setTimeout(startShare, 300);
 
 async function connect(all) {
   if (!navigator.bluetooth) { addLog("Trình duyệt này không hỗ trợ Web Bluetooth. Hãy mở bằng app BLE Link."); return; }
