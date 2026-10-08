@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Theo dõi gậy thông minh</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+:root{--card:#fff;--ink:#16222E;--sub:#5A6772;--line:#DCE3E0;--teal:#0F7B6C;--red:#C8352B;--amber:#B86E00}
+@media (prefers-color-scheme:dark){:root{--card:#182028;--ink:#E8EEF0;--sub:#93A1AB;--line:#273340;--teal:#3DB8A4;--red:#EF6B60;--amber:#E8A33A}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink)}
+#map{position:absolute;inset:0}
+#panel{position:absolute;z-index:1000;left:12px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));max-width:440px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:0 4px 18px rgba(0,0,0,.18)}
+.row{display:flex;align-items:center;gap:8px}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--sub);flex:none}
+.dot.ok{background:var(--teal)}.dot.slow{background:var(--amber)}.dot.lost{background:var(--red)}
+#state{font-size:17px;font-weight:700}
+#age{font-size:14px;color:var(--sub);margin:2px 0 10px 20px}
+dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0 0 10px;font-size:14px}
+dt{color:var(--sub)}dd{margin:0}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:14px}
+a{color:var(--teal);font-weight:600}
+details{margin-top:10px;font-size:13px;color:var(--sub)}
+summary{cursor:pointer}
+input{width:100%;padding:9px;margin:8px 0;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--ink);font-size:13px}
+button{padding:9px 14px;border:0;border-radius:8px;background:var(--teal);color:#fff;font-weight:600;font-size:14px;cursor:pointer}
+#alert{position:absolute;z-index:1100;left:12px;right:12px;top:max(12px,env(safe-area-inset-top));max-width:440px;border-radius:14px;padding:14px 16px;color:#fff;box-shadow:0 4px 18px rgba(0,0,0,.3)}
+#alert.FALL{background:var(--red)}#alert.SOS{background:#B85C00}
+#alert h2{margin:0 0 2px;font-size:18px}
+#alert p{margin:0 0 10px;font-size:14px;opacity:.95}
+#alert .btns{display:flex;gap:8px}
+#alert button{background:#fff;color:#16222E;flex:1}
+#alert[hidden]{display:none}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="alert" hidden>
+  <h2 id="aTitle"></h2>
+  <p id="aTime"></p>
+  <div class="btns"><button id="aSee">Xem vị trí</button><button id="aAck">Đã biết</button></div>
+</div>
+
+<section id="panel">
+  <div class="row"><span class="dot" id="dot"></span><span id="state">Đang kết nối...</span></div>
+  <div id="age"></div>
+  <dl>
+    <dt>Tọa độ</dt><dd id="coord">chưa có</dd>
+    <dt>Sai số</dt><dd id="acc">chưa có</dd>
+    <dt>Bluetooth gậy</dt><dd id="ble">chưa có</dd>
+  </dl>
+  <div class="bar">
+    <a id="gmaps" href="#" target="_blank" rel="noopener">Mở Google Maps</a>
+    <label><input type="checkbox" id="follow" checked style="width:auto;margin:0 6px 0 0">Tự theo dõi</label>
+  </div>
+  <details>
+    <summary>Địa chỉ Firebase</summary>
+    <input id="url" autocomplete="off" autocapitalize="off">
+    <button id="save">Lưu và tải lại</button>
+  </details>
+</section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-app-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.7.1/firebase-database-compat.js"></script>
+<script>
+const DEFAULT_URL = "https://smart-cane-12a77-default-rtdb.asia-southeast1.firebasedatabase.app";
+const $ = id => document.getElementById(id);
+function store(k, v) {
+  try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; }
+}
+const url = (store("dashUrl") || DEFAULT_URL).replace(/\/$/, "");
+$("url").value = url;
+$("save").onclick = () => { store("dashUrl", $("url").value.trim()); location.reload(); };
+
+const map = L.map("map", { zoomControl: false }).setView([21.0278, 105.8342], 13);
+L.control.zoom({ position: "topright" }).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19, attribution: "&copy; OpenStreetMap"
+}).addTo(map);
+
+let cur = null, alertData = null, offset = 0, marker = null, alertMarker = null;
+
+function setState(cls, text) { $("dot").className = "dot " + cls; $("state").textContent = text; }
+
+function ageText(s) {
+  if (s < 5) return "vừa cập nhật";
+  if (s < 60) return Math.round(s) + " giây trước";
+  if (s < 3600) return Math.round(s / 60) + " phút trước";
+  return Math.round(s / 3600) + " giờ trước";
+}
+
+function render() {
+  if (!cur) return;
+  const age = Math.max(0, (Date.now() + offset - cur.updatedAt) / 1000);
+  if (age < 45) setState("ok", "Đang theo dõi");
+  else if (age < 180) setState("slow", "Tín hiệu chậm");
+  else setState("lost", "Mất tín hiệu");
+  $("age").textContent = "Cập nhật " + ageText(age);
+}
+
+function renderAlert() {
+  const el = $("alert");
+  if (alertMarker) { map.removeLayer(alertMarker); alertMarker = null; }
+  if (!alertData || alertData.ack) { el.hidden = true; return; }
+  el.className = alertData.type;
+  $("aTitle").textContent = alertData.type === "FALL" ? "Người dùng có thể đã bị ngã" : "Người dùng bấm nút SOS";
+  $("aTime").textContent = "Lúc " + new Date(alertData.at).toLocaleTimeString("vi-VN");
+  el.hidden = false;
+  if (alertData.lat != null) {
+    alertMarker = L.circleMarker([alertData.lat, alertData.lng], {
+      radius: 12, color: "#fff", weight: 3, fillColor: "#C8352B", fillOpacity: 1
+    }).addTo(map);
+  }
+}
+
+try {
+  firebase.initializeApp({ databaseURL: url });
+  const db = firebase.database();
+  db.ref(".info/serverTimeOffset").on("value", s => { offset = s.val() || 0; });
+
+  db.ref("smartcane/current").on("value", s => {
+    cur = s.val();
+    if (!cur) { setState("", "Chưa có dữ liệu từ gậy"); return; }
+    const pos = [cur.lat, cur.lng];
+    if (!marker) {
+      marker = L.circleMarker(pos, { radius: 10, color: "#fff", weight: 3, fillColor: "#0F7B6C", fillOpacity: 1 }).addTo(map);
+      map.setView(pos, 17);
+    } else {
+      marker.setLatLng(pos);
+      if ($("follow").checked) map.panTo(pos);
+    }
+    $("coord").textContent = cur.lat.toFixed(6) + ", " + cur.lng.toFixed(6);
+    $("acc").textContent = cur.acc != null ? "khoảng " + cur.acc + " m" : "chưa có";
+    $("ble").textContent = cur.ble ? "đang kết nối" : "đã mất kết nối";
+    $("gmaps").href = "https://www.google.com/maps?q=" + cur.lat + "," + cur.lng;
+    render();
+  }, e => setState("lost", "Không đọc được dữ liệu: " + e.message));
+
+  db.ref("smartcane/alert").on("value", s => { alertData = s.val(); renderAlert(); });
+
+  $("aAck").onclick = () => db.ref("smartcane/alert/ack").set(true);
+  $("aSee").onclick = () => {
+    if (alertData && alertData.lat != null) map.flyTo([alertData.lat, alertData.lng], 17);
+  };
+  setInterval(render, 1000);
+} catch (e) {
+  setState("lost", "Lỗi Firebase: " + e.message);
+}
+</script>
+</body>
+</html>
