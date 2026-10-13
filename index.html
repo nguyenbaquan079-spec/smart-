@@ -57,6 +57,17 @@ input{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);bac
 </section>
 
 <section class="card">
+  <h2>Thông báo Telegram cho người nhà</h2>
+  <p class="note" style="margin:0 0 12px">Khi có SOS hoặc ngã, trang gửi tin nhắn kèm vị trí vào nhóm Telegram. Token và chat id chỉ lưu trên điện thoại này, không nằm trong code.</p>
+  <label for="tgToken">Token của bot</label>
+  <input id="tgToken" type="password" autocomplete="off" autocapitalize="off" placeholder="dán token từ BotFather">
+  <label for="tgChat">Chat id của nhóm</label>
+  <input id="tgChat" autocomplete="off" autocapitalize="off" placeholder="ví dụ: -1001234567890">
+  <button id="tgTest" class="alt">Gửi tin thử vào nhóm</button>
+  <p class="note" id="tgNote"></p>
+</section>
+
+<section class="card">
   <h2>Nhật ký</h2>
   <div class="log" id="log"></div>
 </section>
@@ -131,10 +142,11 @@ function pushCurrent() {
   }
 }
 
-function sendAlert(type) {
+function sendAlert(type, test) {
   const now = Date.now();
   if (lastAlert[type] && now - lastAlert[type] < COOLDOWN_MS) return;
   lastAlert[type] = now;
+  notifyTelegram(type, test);   /* gửi tin cho người nhà, không phụ thuộc Firebase */
   if (!ensureDb()) { addLog("Chưa gửi được cảnh báo " + type + ": thiếu địa chỉ Firebase."); return; }
   db.ref("smartcane/alert")
     .set({ type, lat: gps ? gps.lat : null, lng: gps ? gps.lng : null, at: now, ack: false })
@@ -228,8 +240,58 @@ function handle(msg) {
   else addLog("Nhận: " + msg);
 }
 
-$("testSos").onclick = () => { addLog("Gửi thử SOS.", "sos"); sendAlert("SOS"); };
-$("testFall").onclick = () => { addLog("Gửi thử ngã.", "fall"); sendAlert("FALL"); };
+/* ===================== Telegram ===================== */
+$("tgToken").value = store("tgToken") || "";
+$("tgChat").value = store("tgChat") || "";
+["tgToken", "tgChat"].forEach(id => {
+  $(id).addEventListener("change", () => store(id, $(id).value.trim()));
+});
+
+async function tgCall(method, params) {
+  const token = $("tgToken").value.trim(), chat = $("tgChat").value.trim();
+  if (!token || !chat) return { ok: false, description: "Chưa nhập token hoặc chat id." };
+  const url = "https://api.telegram.org/bot" + token + "/" + method + "?" +
+    new URLSearchParams(Object.assign({ chat_id: chat }, params));
+  try {
+    const r = await fetch(url);
+    return await r.json();
+  } catch (e) {
+    return { ok: false, description: "Không đọc được phản hồi (" + e.message + "). Hãy kiểm tra nhóm Telegram xem tin đã tới chưa." };
+  }
+}
+
+function dashUrl() {
+  return location.origin + location.pathname.replace(/[^/]*$/, "") + "dashboard.html";
+}
+
+async function notifyTelegram(type, test) {
+  if (!$("tgToken").value.trim() || !$("tgChat").value.trim()) {
+    addLog("Chưa gửi Telegram: thiếu token hoặc chat id.");
+    return;
+  }
+  let text = (test ? "[THỬ NGHIỆM] " : "") +
+    (type === "FALL" ? "⚠️ GẬY THÔNG MINH: PHÁT HIỆN NGÃ" : "🆘 GẬY THÔNG MINH: NGƯỜI DÙNG BẤM SOS");
+  text += "\nLúc " + new Date().toLocaleTimeString("vi-VN");
+  if (gps) {
+    text += "\nVị trí: https://www.google.com/maps?q=" + gps.lat + "," + gps.lng +
+            " (sai số khoảng " + gps.acc + " m)";
+  } else {
+    text += "\nChưa có vị trí GPS.";
+  }
+  text += "\nTheo dõi trực tiếp: " + dashUrl();
+  const res = await tgCall("sendMessage", { text });
+  addLog(res.ok ? "Đã gửi tin Telegram cho người nhà." : "Lỗi Telegram: " + res.description);
+  if (res.ok && gps) { await tgCall("sendLocation", { latitude: gps.lat, longitude: gps.lng }); }
+}
+
+$("tgTest").onclick = async () => {
+  $("tgNote").textContent = "Đang gửi...";
+  const res = await tgCall("sendMessage", { text: "Tin nhắn thử từ Gậy thông minh. Nếu thấy tin này thì kết nối Telegram đã hoạt động." });
+  $("tgNote").textContent = res.ok ? "Đã gửi. Hãy kiểm tra nhóm Telegram." : "Lỗi: " + res.description;
+};
+
+$("testSos").onclick = () => { addLog("Gửi thử SOS.", "sos"); sendAlert("SOS", true); };
+$("testFall").onclick = () => { addLog("Gửi thử ngã.", "fall"); sendAlert("FALL", true); };
 </script>
 </body>
 </html>
